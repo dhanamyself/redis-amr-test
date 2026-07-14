@@ -5,6 +5,13 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+/**
+ * One-click test presets — see {@link PresetService} and the README's "Test presets" table for
+ * what each one actually does. Each returns immediately with a run ID (or null for an idle
+ * consistency-probe run); long-running orchestration continues on a background virtual thread, so
+ * poll {@code GET /loadgen/status} and the relevant KPI report endpoints for progress exactly as
+ * with a manually-started run.
+ */
 @RestController
 @RequestMapping("/presets")
 public class PresetController {
@@ -15,6 +22,15 @@ public class PresetController {
         this.presetService = presetService;
     }
 
+    /**
+     * Runs the named preset.
+     *
+     * @param name one of {@code smoke}, {@code session-peak}, {@code failover-under-load},
+     *             {@code soak}, {@code consistency-probe}
+     * @return the preset name, its run ID (if it started one), and a human-readable note on what
+     *         it did and where to check results
+     * @throws IllegalArgumentException if {@code name} doesn't match a known preset
+     */
     @PostMapping("/{name}/run")
     public PresetService.PresetResult run(@PathVariable String name) {
         return switch (name) {

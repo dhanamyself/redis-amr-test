@@ -1,0 +1,81 @@
+@startuml load-test-metrics-flow
+title KPI 3 Load Test: Session Workload → HdrHistogram Rollups → Throughput Report
+
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 160
+
+actor "Operator /\nDashboard" as Op
+participant "LoadGenController" as Ctrl
+participant "LoadGenService" as Svc
+participant "RunService" as RunSvc
+participant "SessionWorkloadGenerator\n(virtual threads)" as Gen
+participant "MultiDbClient" as MDC
+participant "AMR" as AMR
+participant "OperationRecorder\n(HdrHistogram + Micrometer)" as Rec
+participant "RollupSnapshotTask\n(@Scheduled, every 1s)" as Snap
+database "H2: MetricRollup" as DB
+participant "ThroughputService" as Report
+
+== Start ==
+Op -> Ctrl : POST /loadgen/start\n{concurrency, targetOpsPerSec, ratio, ...}
+Ctrl -> Ctrl : resolveConfig()\n(merge request with amrkpi.workload.* defaults)
+Ctrl -> Svc : start(LoadGenConfig)
+Svc -> RunSvc : startRun("loadgen", warmUpSeconds, config)
+RunSvc -> DB : persist Run row\n(configJson = full effective config)
+RunSvc --> Svc : runId
+Svc -> Gen ** : new SessionWorkloadGenerator(client, recorder, endpoints, runId, config)
+Svc -> Gen : Thread.ofVirtual().start(generator::run)
+Svc --> Ctrl : runId
+Ctrl --> Op : { runId }
+
+== Steady state (closed-loop or open-loop paced) ==
+loop until duration elapsed or /loadgen/stop
+  Gen -> Gen : pick op by readWriteRatio\n(KeyGenerator: 80/20 hot-set skew)
+  alt read (sliding expiration)
+    Gen -> MDC : GETEX key, EX ttlSeconds
+  else write ("session update": read-modify-write)
+    Gen -> MDC : GET key
+    Gen -> MDC : SET key, newValue, EX ttlSeconds\n(ValueGenerator: log-normal size)
+  end
+  MDC -> AMR : command (through weighted failover client)
+  AMR --> MDC : result
+  alt success
+    Gen -> Rec : recordSuccess(runId, region, "loadgen.get|set", durationNanos)
+  else failure
+    Gen -> Rec : recordError(runId, region, "loadgen.get|set", ErrorCategory.classify(e))
+  end
+end
+note right of Rec
+  Every op updates an in-memory HdrHistogram Recorder
+  keyed by (runId, region, operation) -- NOT persisted
+  per sample. At session-store intensity, persisting
+  every op would make the harness bottleneck on its
+  own instrumentation.
+end note
+
+== Every rollup-interval-seconds (default 1s) ==
+Snap -> Rec : activeKeys()
+loop each (runId, region, operation) key
+  Snap -> Rec : takeIntervalHistogram(key)\n(resets the histogram)
+  Snap -> Rec : takeAndResetErrorCounts(key)
+  Snap -> RunSvc : isWithinWarmUp(runId, now)
+  Snap -> Snap : compute min/p50/p95/p99/p99.9/max
+  Snap -> DB : save MetricRollup\n(count, percentiles, errorCountsJson, warmUp flag)
+  Snap -> Rec : cleanupIfDrained(key, snapshotCount)\n(purges keys for ended runs once empty)
+end
+
+== Stop (optional, before duration elapses) ==
+Op -> Ctrl : POST /loadgen/stop
+Ctrl -> Svc : stop()
+Svc -> Gen : requestStop()
+Gen -> Gen : workers exit on next loop check
+Gen -> RunSvc : endRun(runId, COMPLETED/STOPPED)
+
+== Report ==
+Op -> Report : GET /kpi/throughput/{runId}
+Report -> DB : findByRunIdOrderByWindowStartAsc(runId)
+Report -> Report : RollupAggregator.aggregate(...)\n(warm-up excluded, weighted-avg percentiles)
+Report --> Op : achieved vs target ops/sec,\nlatency through p99.9,\nerror breakdown by op + region
+
+@enduml

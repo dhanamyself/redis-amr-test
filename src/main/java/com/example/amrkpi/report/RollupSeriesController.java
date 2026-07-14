@@ -14,7 +14,11 @@ import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 
-/** Raw rollup time series for dashboard charts (network time, throughput). */
+/**
+ * Raw rollup time series for dashboard charts (network time, throughput). This is a passthrough
+ * of individual rollup rows, not an aggregation — it doesn't duplicate the aggregation logic in
+ * {@link RollupAggregator}, it just lists the raw points a chart needs to plot over time.
+ */
 @RestController
 public class RollupSeriesController {
 
@@ -26,6 +30,18 @@ public class RollupSeriesController {
         this.objectMapper = objectMapper;
     }
 
+    /**
+     * Lists individual rollup points for one operation, for charting. Scope by either
+     * {@code runId} (all rollups for that run, ignoring the time window) or {@code region} +
+     * {@code from}/{@code to}; with neither, returns all regions in the window.
+     *
+     * @param operation the rollup operation key (e.g. {@code loadgen.get}, {@code network.ping})
+     * @param region    optional region filter
+     * @param runId     optional run ID filter — takes precedence over the time window when set
+     * @param from      window start (ignored if {@code runId} is set); defaults to 10 minutes before {@code to}
+     * @param to        window end (ignored if {@code runId} is set); defaults to now
+     * @return one point per rollup window: count, p50/p95/p99, and total error count
+     */
     @GetMapping("/report/series")
     public List<RollupPoint> series(
             @RequestParam String operation,

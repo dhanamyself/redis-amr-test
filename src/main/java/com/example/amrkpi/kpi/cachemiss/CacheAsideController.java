@@ -11,6 +11,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * REST surface for KPI 6 (cache-aside / read-miss). Exercises a real GET-miss-populate cycle
+ * against AMR via {@link CacheAsideService}, backed by an H2 source-of-truth stand-in on miss —
+ * see {@link SourceOfTruthService}. See the sequence diagram at
+ * {@code docs/ARCHITECTURE.md § 4} for the hit/miss/degraded branch behavior in full.
+ */
 @RestController
 @RequestMapping("/kpi/cache-aside")
 public class CacheAsideController {
@@ -21,6 +27,16 @@ public class CacheAsideController {
         this.service = service;
     }
 
+    /**
+     * Performs one cache-aside GET (key is prefixed with {@code cacheaside:}), for manual testing
+     * or demos. Classifies as a hit, a miss (populates Redis with TTL from the source-of-truth
+     * stand-in), or degraded (Redis unavailable — falls back to the source of truth without
+     * repopulating).
+     *
+     * @param key   the logical session key, without the {@code cacheaside:} prefix
+     * @param runId optional run ID to tag the recorded metrics with; defaults to "background"
+     * @return the session value, from cache, the source of truth, or the degraded fallback
+     */
     @GetMapping("/get")
     public String get(@RequestParam String key, @RequestParam(required = false) String runId) {
         return service.get("cacheaside:" + key, runId);
@@ -32,7 +48,15 @@ public class CacheAsideController {
     public record RunResult(int requestCount, int keySpaceSize, long tookMillis) {
     }
 
-    /** Drives a burst of cache-aside GETs across a bounded key space to populate the report. */
+    /**
+     * Drives a burst of cache-aside GETs across a bounded key space (virtual-thread concurrency)
+     * to populate the report with a realistic hit/miss mix, rather than requiring manual repeated
+     * calls to {@link #get}.
+     *
+     * @param request optional tuning: key-space size (default 500), request count (default 2000),
+     *                concurrency (default 16), and an optional run ID to tag results with
+     * @return how many requests ran, over what key space, and how long it took
+     */
     @PostMapping("/run")
     public RunResult run(@RequestBody(required = false) RunRequest request) {
         int keySpaceSize = (request != null && request.keySpaceSize() != null) ? request.keySpaceSize() : 500;
@@ -66,6 +90,14 @@ public class CacheAsideController {
         return new RunResult(requestCount, keySpaceSize, System.currentTimeMillis() - start);
     }
 
+    /**
+     * Aggregates hit/miss/degraded counts, miss ratio, and per-branch latency stats over a time
+     * window, via {@link com.example.amrkpi.report.RollupAggregator}.
+     *
+     * @param from window start; defaults to one hour before {@code to}
+     * @param to   window end; defaults to now
+     * @return hit/miss/degraded counts, miss ratio, and latency stats for each branch
+     */
     @GetMapping("/report")
     public CacheAsideReport report(
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant from,

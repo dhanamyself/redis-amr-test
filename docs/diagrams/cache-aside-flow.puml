@@ -1,0 +1,68 @@
+@startuml cache-aside-flow
+title KPI 6: Cache-Aside — Hit, Miss, and Degraded (Cache-Less) Paths
+
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 160
+
+actor "Client" as Client
+participant "CacheAsideController" as Ctrl
+participant "CacheAsideService" as Svc
+participant "MultiDbClient\n(AMR)" as MDC
+participant "SourceOfTruthService\n(H2-backed stand-in)" as SoT
+participant "OperationRecorder" as Rec
+
+Client -> Ctrl : GET /kpi/cache-aside/get?key=foo
+Ctrl -> Svc : get("cacheaside:foo", runId)
+Svc -> Svc : start = System.nanoTime()
+
+Svc -> MDC : GET key
+
+alt HIT -- value present in Redis
+  MDC --> Svc : value
+  Svc -> Rec : recordSuccess(runId, region, "cacheaside.hit", elapsed)
+  Svc --> Ctrl : value
+  Ctrl --> Client : value
+
+else MISS -- key absent or expired
+  MDC --> Svc : null
+  Svc -> SoT : fetch(key)
+  note right of SoT
+    Stand-in for a real system of record --
+    NOT part of the AMR validation itself.
+    Adds a small simulated latency so the
+    miss cost is actually visible in reports.
+  end note
+  SoT --> Svc : value (generated + persisted if new)
+  Svc -> MDC : SET key, value, EX ttlSeconds
+  MDC --> Svc : OK
+  Svc -> Rec : recordSuccess(runId, region, "cacheaside.miss", elapsed)
+  Svc --> Ctrl : value
+  Ctrl --> Client : value
+
+else DEGRADED -- Redis unavailable (breaker OPEN / connection error)
+  MDC --> Svc : throws (JedisConnectionException,\nCallNotPermittedException, ...)
+  Svc -> Rec : recordError(runId, region, "cacheaside.degraded",\nErrorCategory.classify(e))
+  Svc -> SoT : fetch(key)
+  note right of Svc
+    Falls back straight to the source of truth --
+    does NOT attempt to repopulate Redis while
+    it's known to be unavailable. This IS the
+    "degraded mode" demonstration Microsoft
+    recommends: the report's cacheaside.degraded
+    latency is the price of running cache-less.
+  end note
+  SoT --> Svc : value
+  Svc -> Rec : recordSuccess(runId, region, "cacheaside.degraded", elapsed)
+  Svc --> Ctrl : value
+  Ctrl --> Client : value
+end
+
+== Report ==
+Client -> Ctrl : GET /kpi/cache-aside/report
+Ctrl -> Svc : report(from, to)
+Svc -> Svc : aggregate hit / miss / degraded rollups\n(RollupAggregator, per operation)
+Svc --> Ctrl : hitCount, missCount, degradedCount,\nmissRatio, latency stats per branch
+Ctrl --> Client : CacheAsideReport
+
+@enduml

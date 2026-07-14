@@ -11,6 +11,12 @@ import org.springframework.web.bind.annotation.RestController;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 
+/**
+ * REST surface for KPI 7 (network time). Reports round-trip PING latency to one region, isolated
+ * from command processing, from rollups produced by {@link NetworkTimeProbeScheduler} — a
+ * high-frequency probe (default every 200ms) run on a dedicated connection, never through the
+ * load generator's pool (see the probe-isolation note in {@code ProbeConnectionFactory}).
+ */
 @RestController
 public class NetworkTimeController {
 
@@ -22,6 +28,15 @@ public class NetworkTimeController {
         this.aggregator = aggregator;
     }
 
+    /**
+     * Aggregates network-time rollups for one region over a window (full percentile distribution
+     * through p99.9, achieved samples/sec, error breakdown).
+     *
+     * @param region the region name (e.g. {@code canada-central})
+     * @param from   window start; defaults to 15 minutes before {@code to}
+     * @param to     window end; defaults to now
+     * @return aggregated round-trip latency stats for the region
+     */
     @GetMapping("/kpi/network-time")
     public AggregateStats networkTime(
             @RequestParam String region,

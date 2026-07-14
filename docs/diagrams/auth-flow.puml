@@ -1,0 +1,104 @@
+@startuml auth-flow
+title Entra ID Managed Identity Auth Flow (Workload Identity → AuthXManager → AMR)
+
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 160
+
+box "AKS platform (precondition, owned by platform team)" #F4F4F4
+  participant "Workload Identity\nWebhook" as Webhook
+end box
+
+box "This app" #EAF2FF
+  participant "AmrAuthConfig" as AuthConfig
+  participant "DefaultAzureCredential" as Cred
+  participant "AuthXManager\n(redis-authx-entraid)" as AuthX
+  participant "JedisClientConfig\n(shared by all pools)" as ClientConfig
+  participant "Jedis Connection\n(main pool / probe pools)" as Conn
+  participant "EventRecorder\n(KPI 8: token lifecycle)" as EventRec
+end box
+
+participant "Entra ID (AAD)" as AAD
+participant "AMR (Redis)" as AMR
+
+== Pod scheduling (once, before this app runs) ==
+Webhook -> Webhook : Pod carries label\nazure.workload.identity/use: "true"
+note right of Webhook
+  Injects AZURE_CLIENT_ID, AZURE_TENANT_ID,
+  AZURE_FEDERATED_TOKEN_FILE, AZURE_AUTHORITY_HOST
+  into the pod. This app never sets these itself.
+end note
+
+== App startup ==
+AuthConfig -> Cred ** : new DefaultAzureCredentialBuilder().build()
+note right of Cred
+  Tries a chain: Environment, WorkloadIdentity,
+  ManagedIdentity, AzureCli, ... first success wins.
+  Locally: "az login" satisfies AzureCliCredential
+  with **zero code changes**.
+end note
+
+AuthConfig -> AuthConfig : AzureTokenAuthConfigBuilder\n  .defaultAzureCredential(credential)\n  .scopes(amr.auth.token-scope)\n  .build()
+AuthConfig -> AuthX ** : new AuthXManager(tokenAuthConfig)
+AuthConfig -> AuthX : setListener(...)\naddPostAuthenticationHook(...)
+AuthConfig -> AuthX : **start()**
+note right of AuthConfig
+  Must be called explicitly -- nothing in Jedis
+  calls this automatically. Skipping it means
+  every connection auth attempt fails with no
+  token ever acquired (verified against source).
+end note
+
+activate AuthX
+AuthX -> AAD : request token\n(scope: https://redis.azure.com/.default)
+alt every credential in the chain fails
+  AAD --> AuthX : no credential available
+  AuthX --> AuthConfig : throws JedisAuthenticationException
+  AuthConfig --> AuthConfig : Spring context refresh **aborts**\n(fail-fast -- see README)
+else at least one credential succeeds
+  AAD --> AuthX : access token (~1h lifetime)
+  AuthX -> AuthX : store as currentToken
+end
+deactivate AuthX
+
+AuthConfig -> ClientConfig ** : DefaultJedisClientConfig.builder()\n  .authXManager(authXManager)\n  .sslOptions(SslOptions.defaults())\n  .build()
+note right of ClientConfig
+  ONE AuthXManager instance is shared by every
+  JedisClientConfig in the app: the main
+  MultiDbClient pool AND both probe pools.
+end note
+
+== Connection open (any pool) ==
+Conn -> ClientConfig : open connection using this config
+ClientConfig -> AuthX : addConnection(connection)
+note right of AuthX
+  Connection registers a WEAK reference with the
+  manager -- this is how renewal later finds it.
+end note
+Conn -> AMR : AUTH <token value> (TLS, port 10000)
+AMR --> Conn : OK
+
+== Background token renewal (recurs roughly hourly) ==
+AuthX -> AAD : renew token before expiry
+alt renewal succeeds
+  AAD --> AuthX : new access token
+  AuthX -> AuthX : authenticateConnections(token)
+  loop every live registered connection
+    AuthX -> Conn : connection.setCredentials(token)
+    note right
+      Re-authenticated IN PLACE --
+      connection is never closed/recreated.
+      This is the property KPI 8 / the
+      "soak" preset exists to verify holds
+      up under sustained load.
+    end note
+  end
+  AuthX -> EventRec : postAuthenticationHook(token)
+  EventRec -> EventRec : record TOKEN_RENEWAL / SUCCESS
+else renewal fails
+  AAD --> AuthX : error
+  AuthX -> EventRec : onIdentityProviderError(reason)
+  EventRec -> EventRec : record TOKEN_RENEWAL / FAILURE\n(ErrorCategory.AUTH_FAILURE)
+end
+
+@enduml

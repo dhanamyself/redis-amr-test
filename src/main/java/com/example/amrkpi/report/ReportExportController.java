@@ -34,6 +34,18 @@ public class ReportExportController {
         this.pdfWriter = pdfWriter;
     }
 
+    /**
+     * Exports a point-in-time report — run configuration block, summary stats per KPI, and (for
+     * CSV/XLSX) full tabular detail — as a downloadable file.
+     *
+     * @param format  {@code csv} (default), {@code xlsx}, or {@code pdf}
+     * @param runId   optional run ID; when present, includes run-scoped KPI 3 throughput data and
+     *                the run's persisted effective configuration
+     * @param kpis    accepted but not yet applied — see the class-level note above
+     * @param from    window start; defaults to one hour before {@code to}
+     * @param to      window end; defaults to now
+     * @return the rendered report as an attachment with the appropriate content type
+     */
     @GetMapping("/reports/export")
     public ResponseEntity<byte[]> export(
             @RequestParam(defaultValue = "csv") String format,

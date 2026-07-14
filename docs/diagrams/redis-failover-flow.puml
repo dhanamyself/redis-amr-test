@@ -1,0 +1,94 @@
+@startuml redis-failover-flow
+title Redis Connectivity: Weighted Failover, Circuit Breaker, and Failback
+
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 160
+
+participant "Load generator /\ncache-aside path" as Client
+participant "MultiDbClient" as MDC
+participant "MultiDbConnectionProvider" as Provider
+participant "Database: Canada Central\n(weight 1.0, priority 1)" as CC
+participant "Database: Canada East\n(weight 0.5, priority 2)" as CE
+participant "Resilience4j\nCircuitBreaker (per endpoint)" as Breaker
+participant "AmrRedisClientConfig\nlisteners" as Listener
+participant "EventRecorder" as EventRec
+
+== Normal operation ==
+loop every health-check interval (default 1s)
+  Provider -> CC : PingStrategy probe
+  CC --> Provider : healthy
+end
+
+Client -> MDC : GET/SET command
+MDC -> Provider : route to active database
+Provider -> CC : forwarded command
+CC --> Provider : result
+Provider --> MDC : result
+MDC --> Client : result
+
+== Regional failure (real, or KPI 4's induced simulation) ==
+note over CC
+  KPI 4 induces this via the REAL public API
+  Database.setDisabled(true) -- not a fake
+  unreachable host. See FailoverSimulationService.
+end note
+
+alt genuine command failures against Canada Central
+  Client -> MDC : GET/SET command
+  MDC -> Provider : route to active database
+  Provider -> CC : forwarded command
+  CC --> Provider : JedisConnectionException
+  Provider -> Breaker : record failure
+end
+
+Breaker -> Breaker : failure-rate threshold exceeded\nwithin sliding window (amr.circuit-breaker.*)
+Breaker -> Breaker : state CLOSED -> OPEN
+Breaker -> Listener : onStateTransition(CLOSED -> OPEN)
+Listener -> EventRec : record BREAKER_STATE_TRANSITION\n(region=canada-central, toState=OPEN)
+
+Provider -> Provider : Canada Central no longer healthy/eligible
+Provider -> CE : next-highest-weight healthy database selected
+Provider -> Listener : DatabaseSwitchEvent\n(reason=CIRCUIT_BREAKER or HEALTH_CHECK)
+Listener -> Listener : stamp Instant.now()\n(event carries no timestamp itself)
+Listener -> EventRec : record FAILOVER_TRANSITION\n(outcome=SWITCHED_ACTIVE, region=canada-east)
+
+== Traffic now served from the failover region ==
+Client -> MDC : GET/SET command
+MDC -> Provider : route to active database
+Provider -> CE : forwarded command
+CE --> Provider : result
+Provider --> MDC : result
+MDC --> Client : result
+note right of CE
+  KPI 1 (uptime) and KPI 3 (throughput) both see
+  this transition in their rollups/events --
+  KPI 4's report correlates the induced window
+  against the concurrent load test's error/latency
+  spike using exactly this timeline.
+end note
+
+== Recovery and failback ==
+Provider -> CC : PingStrategy probe (still running independently)
+CC --> Provider : healthy again
+note over Provider
+  amr.failback.grace-period-millis (default 60s)
+  must elapse before failback is attempted,
+  to avoid flapping.
+end note
+
+Provider -> Provider : grace period elapses
+Provider -> Breaker : (breaker may still be OPEN;\ntransitions per its own config)
+Breaker -> Listener : onStateTransition(OPEN -> CLOSED)
+Listener -> EventRec : record BREAKER_STATE_TRANSITION
+
+Provider -> CC : switch back (reason=FAILBACK)
+Provider -> Listener : DatabaseSwitchEvent(reason=FAILBACK)
+Listener -> EventRec : record FAILOVER_TRANSITION\n(outcome=SWITCHED_ACTIVE, region=canada-central)
+
+Client -> MDC : GET/SET command
+MDC -> Provider : route to active database
+Provider -> CC : forwarded command (back to priority-1)
+CC --> Provider : result
+
+@enduml
