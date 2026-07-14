@@ -1,12 +1,15 @@
 # syntax=docker/dockerfile:1
 
 # --- Build stage -------------------------------------------------------------
-FROM maven:3.9-eclipse-temurin-21 AS build
+FROM eclipse-temurin:21-jdk AS build
 WORKDIR /build
-COPY pom.xml .
-RUN mvn -q -B dependency:go-offline
+COPY gradlew settings.gradle build.gradle ./
+COPY gradle ./gradle
+# Warms the Gradle distribution + dependency caches in their own layer, so a source-only
+# change doesn't force re-downloading everything on the next build.
+RUN ./gradlew --no-daemon dependencies > /dev/null
 COPY src ./src
-RUN mvn -q -B package -DskipTests
+RUN ./gradlew --no-daemon build -x test
 
 # --- Runtime stage -------------------------------------------------------------
 FROM eclipse-temurin:21-jre
@@ -16,7 +19,7 @@ RUN groupadd --system amrkpi && useradd --system --gid amrkpi --home-dir /app am
     && mkdir -p /app/data \
     && chown -R amrkpi:amrkpi /app
 
-COPY --from=build /build/target/amr-kpi-harness.jar /app/app.jar
+COPY --from=build /build/build/libs/amr-kpi-harness.jar /app/app.jar
 
 USER amrkpi
 EXPOSE 8080

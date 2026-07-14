@@ -1,0 +1,79 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.5.16'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'com.example'
+version = '1.0.0-SNAPSHOT'
+description = 'Standalone Spring Boot test harness validating Azure Managed Redis (AMR) as a session/context store, run from inside AKS'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    jedisVersion = '7.5.3'
+    redisAuthxEntraidVersion = '0.1.1-beta2'
+    azureIdentityVersion = '1.18.4'
+    resilience4jVersion = '1.7.1'
+    hdrHistogramVersion = '2.2.2'
+    poiVersion = '5.3.0'
+    pdfboxVersion = '2.0.31'
+}
+
+dependencies {
+    // Core web / actuator / thymeleaf dashboard
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.springframework.boot:spring-boot-starter-thymeleaf'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+    // H2 persisted store (rollups + low-frequency events + run metadata)
+    runtimeOnly 'com.h2database:h2'
+
+    // Redis client
+    implementation "redis.clients:jedis:${jedisVersion}"
+
+    // Entra ID token auth for AMR
+    implementation "redis.clients.authentication:redis-authx-entraid:${redisAuthxEntraidVersion}"
+    implementation "com.azure:azure-identity:${azureIdentityVersion}"
+
+    // Resilience4j backing MultiDbClient's circuit breaker / retry (not bundled by Jedis)
+    implementation "io.github.resilience4j:resilience4j-all:${resilience4jVersion}"
+    implementation "io.github.resilience4j:resilience4j-circuitbreaker:${resilience4jVersion}"
+    implementation "io.github.resilience4j:resilience4j-retry:${resilience4jVersion}"
+
+    // Metrics: Micrometer (via actuator) + HdrHistogram engine
+    implementation "org.hdrhistogram:HdrHistogram:${hdrHistogramVersion}"
+
+    // Report export
+    implementation "org.apache.poi:poi-ooxml:${poiVersion}"
+    implementation "org.apache.pdfbox:pdfbox:${pdfboxVersion}"
+
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+
+tasks.named('bootJar') {
+    archiveBaseName = 'amr-kpi-harness'
+    archiveVersion = ''
+    archiveClassifier = ''
+}
+
+tasks.named('jar') {
+    enabled = false
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}

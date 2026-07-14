@@ -167,7 +167,7 @@ What this buys you, all from the client library rather than custom code:
   waiting for a real command to fail against it.
 - **A real Resilience4j circuit breaker per endpoint** — configured via
   `amr.circuit-breaker.*` (failure-rate threshold, sliding window, minimum calls). Jedis doesn't
-  bundle Resilience4j itself; it's an explicit `pom.xml` dependency this config wires in.
+  bundle Resilience4j itself; it's an explicit `build.gradle` dependency this config wires in.
 - **Bounded retry with backoff** (`amr.retry.*`) — never infinite.
 - **Failback with a grace period** (`amr.failback.grace-period-millis`, default 60s) — once the
   higher-priority endpoint recovers, the client waits out the grace period before switching back,
@@ -425,10 +425,10 @@ a failover.
 | Requirement | Why |
 |---|---|
 | **Java 21** | Virtual threads (`Executors.newVirtualThreadPerTaskExecutor()`) are load-bearing for the load generator, not optional. |
-| **Maven** (or just use the wrapper: `./mvnw`) | Build tool. |
+| **Nothing else to install for the build** — just use the wrapper: `./gradlew` | The wrapper downloads the exact pinned Gradle version (see `gradle/wrapper/gradle-wrapper.properties`) on first run; no separate Gradle install needed. |
 | **Azure CLI (`az`), logged in** (`az login`) | See [below](#why-you-actually-need-az-login-not-optional) — this is not optional. |
 | **An AMR instance (or two) reachable from your machine, with RBAC granted to your `az login` identity** | Without this the app starts but every Redis operation fails auth. |
-| **Docker** (optional) | Only needed if you want to build/run the container image locally instead of via Maven. |
+| **Docker** (optional) | Only needed if you want to build/run the container image locally instead of via Gradle. |
 
 ### Why you actually need `az login` (not optional)
 
@@ -475,22 +475,23 @@ git clone <this-repo>
 cd redis-amr-test
 
 # Build (runs the full test suite — see "Guide for developers" below)
-./mvnw clean package
+./gradlew clean build
 
 # Run, pointing at your AMR instance(s)
 AMR_CC_HOST=<your-cc-host>.canadacentral.redis.azure.net \
 AMR_CE_HOST=<your-ce-host>.canadaeast.redis.azure.net \
-./mvnw spring-boot:run
+./gradlew bootRun
 ```
 
 Or run the packaged jar directly:
 
 ```bash
 AMR_CC_HOST=<your-cc-host> AMR_CE_HOST=<your-ce-host> \
-java -jar target/amr-kpi-harness.jar
+java -jar build/libs/amr-kpi-harness.jar
 ```
 
-Or via Docker (the multi-stage `Dockerfile` builds and runs it in one shot):
+Or via Docker (the multi-stage `Dockerfile` builds and runs it in one shot, using the project's
+own Gradle wrapper inside the build stage):
 
 ```bash
 docker build -t amr-kpi-harness .
@@ -501,11 +502,11 @@ docker run -p 8080:8080 \
 
 **Note on Docker + `az login`**: `az login`'s credential cache lives on your host machine, not
 inside the container, so `DefaultAzureCredential` won't find it from within `docker run` the way
-it does when running via `./mvnw spring-boot:run` directly on your machine. For local Docker
-testing you'll need a separate local federated-credential/service-principal setup exported as the
-same env vars AKS would inject (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
-`AZURE_FEDERATED_TOKEN_FILE`, `AZURE_AUTHORITY_HOST`), or just run via Maven locally where the
-`az login` session is directly visible.
+it does when running via `./gradlew bootRun` directly on your machine. For local Docker testing
+you'll need a separate local federated-credential/service-principal setup exported as the same env
+vars AKS would inject (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`,
+`AZURE_AUTHORITY_HOST`), or just run via Gradle locally where the `az login` session is directly
+visible.
 
 ### Verify it's working
 
@@ -526,7 +527,7 @@ check the startup logs for the `WRONGPASS` vs. connection-error distinction desc
 ### Running the tests
 
 ```bash
-./mvnw test
+./gradlew test
 ```
 
 The suite (88 tests as of this writing) mixes pure unit tests (`ErrorCategory`, `PercentileUtil`,
@@ -537,7 +538,8 @@ of every JPA entity (this is what catches schema/DDL bugs — see below), and on
 with only the four Redis-I/O beans mocked (`AuthXManager`, `MultiDbConnectionProvider`,
 `MultiDbClient`, `ProbeConnectionFactory.ProbeClients`) and exercises a real REST call through to
 real H2/JPA persistence. **No test requires a real AMR instance or Azure credentials** — that's
-deliberate, so `./mvnw test` works in CI with zero external dependencies.
+deliberate, so `./gradlew test` works in CI with zero external dependencies. Test reports land in
+`build/reports/tests/test/index.html`.
 
 If you add a bean that performs real I/O at construction time (anything that opens a connection,
 calls a remote API, etc.), it needs to join that mocked set in `UptimeIntegrationTest` or any new
@@ -603,7 +605,8 @@ calls a remote API, etc.), it needs to join that mocked set in `UptimeIntegratio
 
 ### Technology choices (and why)
 
-- **Java 21**, Spring Boot 3.5.x, Maven.
+- **Java 21**, Spring Boot 3.5.x, Gradle (wrapper committed, pinned to 9.6.1 — see
+  `gradle/wrapper/gradle-wrapper.properties`).
 - **Jedis 7.5.3** — virtual threads make simple blocking Jedis calls scale to high concurrency
   without a reactive client, and `MultiDbClient` is the reference implementation of the
   client-side geographic failover pattern Microsoft recommends for AMR active geo-replication.
