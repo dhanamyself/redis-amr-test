@@ -1,0 +1,157 @@
+server:
+  port: 8080
+  shutdown: graceful
+
+spring:
+  application:
+    name: amr-kpi-harness
+  lifecycle:
+    timeout-per-shutdown-phase: 45s
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: jdbc:h2:file:${AMR_H2_PATH:./data/amrkpi};AUTO_SERVER=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 100
+  thymeleaf:
+    cache: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+
+# --- Azure Managed Redis (AMR) topology & auth -----------------------------
+# Every value here is env-var overridable; nothing is hardcoded. See README
+# "AKS / deployment artifacts" for how these map to Deployment env vars.
+amr:
+  endpoints:
+    local:
+      name: canada-central
+      host: ${AMR_CC_HOST:amr-cc.canadacentral.redis.azure.net}
+      port: ${AMR_PORT:10000}
+      weight: 1.0
+      priority: 1
+    failover:
+      name: canada-east
+      host: ${AMR_CE_HOST:amr-ce.canadaeast.redis.azure.net}
+      port: ${AMR_PORT:10000}
+      weight: 0.5
+      priority: 2
+  tls:
+    enabled: true # must stay true everywhere, including load-test paths; never disable cert validation
+  # Clustering policy is a config-time decision — see README "Clustering policy".
+  # Build assumes Enterprise policy (single endpoint per member, UnifiedJedis/MultiDbClient,
+  # no cluster-aware client needed). Flip only after confirming the AMR instances' actual policy.
+  clustering-policy: enterprise
+
+  auth:
+    # Entra ID Workload Identity — DefaultAzureCredential resolves purely from the env vars
+    # the AKS workload-identity webhook injects (AZURE_CLIENT_ID, AZURE_TENANT_ID,
+    # AZURE_FEDERATED_TOKEN_FILE, AZURE_AUTHORITY_HOST). No client ID/secret/access key here.
+    # Known pitfall: some Jedis/managed-identity combinations against AMR fail token
+    # validation (WRONGPASS) with the documented "<resource>/.default" scope and only work
+    # with the bare resource URI, or vice versa depending on client/library version. This is
+    # config-time only — flip it if you see WRONGPASS after confirming RBAC is correct.
+    token-scope: ${AMR_TOKEN_SCOPE:https://redis.azure.com/.default}
+    token-request-timeout-ms: 2000
+
+  pool:
+    max-total: ${AMR_POOL_MAX_TOTAL:64}
+    max-idle: ${AMR_POOL_MAX_IDLE:64}
+    min-idle: ${AMR_POOL_MIN_IDLE:4} # keep modest — large minimums cause reconnect storms after failover
+    max-wait-millis: ${AMR_POOL_MAX_WAIT_MS:500}
+
+  socket:
+    connection-timeout-millis: ${AMR_CONNECT_TIMEOUT_MS:2000}
+    socket-timeout-millis: ${AMR_SOCKET_TIMEOUT_MS:1000}
+    tcp-keep-alive: true
+
+  retry:
+    max-attempts: ${AMR_RETRY_MAX_ATTEMPTS:3}
+    wait-duration-millis: ${AMR_RETRY_WAIT_MS:500}
+    exponential-backoff-multiplier: ${AMR_RETRY_BACKOFF_MULTIPLIER:2}
+
+  circuit-breaker:
+    failure-rate-threshold: ${AMR_CB_FAILURE_RATE_THRESHOLD:10.0}
+    sliding-window-size: ${AMR_CB_SLIDING_WINDOW_SIZE:10}
+    minimum-number-of-calls: ${AMR_CB_MIN_CALLS:20}
+    wait-duration-in-open-state-millis: ${AMR_CB_WAIT_OPEN_MS:60000}
+
+  health-check:
+    interval-millis: ${AMR_HEALTHCHECK_INTERVAL_MS:1000}
+    timeout-millis: ${AMR_HEALTHCHECK_TIMEOUT_MS:1000}
+    num-probes: ${AMR_HEALTHCHECK_NUM_PROBES:3}
+
+  failback:
+    supported: true
+    grace-period-millis: ${AMR_FAILBACK_GRACE_MS:60000}
+    check-interval-millis: ${AMR_FAILBACK_CHECK_INTERVAL_MS:120000}
+
+# --- Metrics architecture ---------------------------------------------------
+amrkpi:
+  metrics:
+    rollup-interval-seconds: ${AMRKPI_ROLLUP_INTERVAL_S:1}
+    percentiles: [0.5, 0.95, 0.99, 0.999]
+
+  # Session workload model defaults (KPI 3 load generator) — see README.
+  workload:
+    value-size-mean-bytes: ${AMRKPI_VALUE_SIZE_MEAN:2048}
+    value-size-max-bytes: ${AMRKPI_VALUE_SIZE_MAX:20480}
+    ttl-seconds: ${AMRKPI_TTL_SECONDS:1800}
+    sliding-expiration: true
+    hot-set-fraction: ${AMRKPI_HOT_SET_FRACTION:0.2}
+    hot-set-access-fraction: ${AMRKPI_HOT_SET_ACCESS_FRACTION:0.8}
+    read-write-ratio: ${AMRKPI_READ_WRITE_RATIO:0.8}
+    default-key-space-size: ${AMRKPI_KEY_SPACE_SIZE:100000}
+    warm-up-seconds: ${AMRKPI_WARMUP_SECONDS:30}
+
+  # Probe cadence (KPI 1 uptime, KPI 7 network-time, KPI 2 geo-replication background probes)
+  probes:
+    uptime-interval-seconds: ${AMRKPI_UPTIME_PROBE_INTERVAL_S:5}
+    network-time-interval-millis: ${AMRKPI_NETTIME_PROBE_INTERVAL_MS:200}
+    geo-replication-interval-seconds: ${AMRKPI_GEOREPL_PROBE_INTERVAL_S:30}
+    geo-replication-poll-timeout-millis: ${AMRKPI_GEOREPL_POLL_TIMEOUT_MS:5000}
+    geo-replication-poll-backoff-millis: ${AMRKPI_GEOREPL_POLL_BACKOFF_MS:50}
+
+  # KPI 8 token lifecycle
+  token-lifecycle:
+    soak-multiple-of-token-lifetime: 2
+    assumed-token-lifetime-seconds: ${AMRKPI_TOKEN_LIFETIME_SECONDS:3600}
+
+  # KPI 9 consistency/conflict
+  consistency:
+    concurrent-write-window-millis: ${AMRKPI_CONSISTENCY_WINDOW_MS:50}
+    convergence-poll-timeout-millis: ${AMRKPI_CONSISTENCY_CONVERGENCE_TIMEOUT_MS:10000}
+
+  # KPI 6 cache-aside / read-miss
+  cache-aside:
+    source-of-truth-simulated-latency-millis: ${AMRKPI_SOT_LATENCY_MS:20}
+    ttl-seconds: ${AMRKPI_CACHE_ASIDE_TTL_SECONDS:300}
+    value-size-bytes: ${AMRKPI_CACHE_ASIDE_VALUE_SIZE:512}
+
+logging:
+  level:
+    root: INFO
+    com.example.amrkpi: INFO

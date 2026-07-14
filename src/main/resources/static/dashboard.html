@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AMR KPI Test Harness</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 20px; background: #0e1117; color: #e6e6e6; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #9aa4b2; font-size: 13px; margin-bottom: 16px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 18px; }
+  .badge { padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; background: #1c2130; border: 1px solid #2a3140; }
+  .badge.CLOSED { color: #4ade80; border-color: #245a3a; }
+  .badge.OPEN, .badge.FORCED_OPEN { color: #f87171; border-color: #6a2a2a; }
+  .badge.HALF_OPEN { color: #fbbf24; border-color: #6a5a20; }
+  button, a.btn { background: #1c2130; color: #e6e6e6; border: 1px solid #2a3140; border-radius: 6px; padding: 6px 12px; font-size: 12px; cursor: pointer; text-decoration: none; }
+  button:hover, a.btn:hover { border-color: #4a5568; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+  .card { background: #161a24; border: 1px solid #242a38; border-radius: 10px; padding: 14px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: #9aa4b2; margin: 0 0 10px; }
+  .stat { font-size: 22px; font-weight: 700; }
+  .stat-row { display: flex; justify-content: space-between; font-size: 12px; color: #9aa4b2; margin-top: 4px; }
+  canvas { max-height: 140px; margin-top: 8px; }
+  .runbanner { font-size: 13px; padding: 8px 12px; border-radius: 8px; background: #161a24; border: 1px solid #242a38; }
+  .runbanner.active { border-color: #245a3a; color: #4ade80; }
+  table { width: 100%; font-size: 12px; border-collapse: collapse; }
+  td, th { text-align: left; padding: 2px 4px; }
+  .muted { color: #9aa4b2; }
+</style>
+</head>
+<body>
+<h1>AMR KPI Test Harness</h1>
+<div class="sub">Azure Managed Redis session/context store validation — live view, auto-refreshes every 5s</div>
+
+<div class="bar">
+  <span id="runBanner" class="runbanner">Loading…</span>
+  <span id="breakerLocal" class="badge">local: …</span>
+  <span id="breakerFailover" class="badge">failover: …</span>
+</div>
+
+<div class="bar">
+  <button onclick="runPreset('smoke')">Run smoke</button>
+  <button onclick="runPreset('session-peak')">Run session-peak</button>
+  <button onclick="runPreset('failover-under-load')">Run failover-under-load</button>
+  <button onclick="runPreset('soak')">Run soak</button>
+  <button onclick="runPreset('consistency-probe')">Run consistency-probe</button>
+  <button onclick="stopLoadgen()">Stop active run</button>
+  <a class="btn" href="/reports/export?format=csv" target="_blank">Export CSV</a>
+  <a class="btn" href="/reports/export?format=xlsx" target="_blank">Export XLSX</a>
+  <a class="btn" href="/reports/export?format=pdf" target="_blank">Export PDF</a>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Uptime (KPI 1)</h2>
+    <div id="uptimeLocal" class="stat-row"><span>local</span><span>–</span></div>
+    <div id="uptimeFailover" class="stat-row"><span>failover</span><span>–</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Network Time p50/p95 (KPI 7, µs)</h2>
+    <canvas id="networkTimeChart"></canvas>
+  </div>
+
+  <div class="card">
+    <h2>Geo-Replication Lag (KPI 2, ms)</h2>
+    <table id="geoTable"><tr><td class="muted">loading…</td></tr></table>
+  </div>
+
+  <div class="card">
+    <h2>Throughput (KPI 3) — active run</h2>
+    <div id="throughputStat" class="stat">–</div>
+    <canvas id="throughputChart"></canvas>
+  </div>
+
+  <div class="card">
+    <h2>Cache-Aside (KPI 6)</h2>
+    <div id="cacheAsideStat" class="stat">–</div>
+    <div id="cacheAsideDetail" class="stat-row"><span></span><span></span></div>
+  </div>
+
+  <div class="card">
+    <h2>Circuit Breaker Time-in-State (KPI 5)</h2>
+    <table id="breakerTable"><tr><td class="muted">loading…</td></tr></table>
+  </div>
+
+  <div class="card">
+    <h2>Token Lifecycle (KPI 8)</h2>
+    <div id="tokenStat" class="stat">–</div>
+  </div>
+
+  <div class="card">
+    <h2>Consistency & Conflict (KPI 9)</h2>
+    <table id="consistencyTable"><tr><td class="muted">loading…</td></tr></table>
+  </div>
+</div>
+
+<script>
+const REGION_LOCAL = null; // resolved from breaker status keys at runtime
+let regions = [];
+let netChart, throughputChart;
+let activeRunId = null;
+
+async function j(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(url + ' -> ' + r.status);
+  return r.json();
+}
+
+function fmtPct(x) { return (x ?? 0).toFixed(3) + '%'; }
+
+async function refreshBreaker() {
+  const states = await j('/kpi/circuit-breaker/status');
+  regions = Object.keys(states);
+  if (regions.length >= 1) {
+    document.getElementById('breakerLocal').textContent = regions[0] + ': ' + states[regions[0]];
+    document.getElementById('breakerLocal').className = 'badge ' + states[regions[0]];
+  }
+  if (regions.length >= 2) {
+    document.getElementById('breakerFailover').textContent = regions[1] + ': ' + states[regions[1]];
+    document.getElementById('breakerFailover').className = 'badge ' + states[regions[1]];
+  }
+
+  const table = document.getElementById('breakerTable');
+  table.innerHTML = '';
+  for (const region of regions) {
+    try {
+      const report = await j('/kpi/circuit-breaker/report?region=' + encodeURIComponent(region));
+      const row = document.createElement('tr');
+      const states = Object.entries(report.timeInStateMillis || {}).map(([k, v]) => k + '=' + Math.round(v / 1000) + 's').join(' ');
+      row.innerHTML = '<td>' + region + '</td><td class="muted">' + states + '</td>';
+      table.appendChild(row);
+    } catch (e) { /* ignore */ }
+  }
+}
+
+async function refreshRun() {
+  const status = await j('/loadgen/status');
+  const banner = document.getElementById('runBanner');
+  if (status.running) {
+    activeRunId = status.runId;
+    banner.textContent = 'Active run: ' + status.runId + ' — achieved ' + status.achievedOpsPerSec.toFixed(1) + ' ops/sec (target '
+      + (status.config.targetOpsPerSec || 'closed-loop') + ')';
+    banner.className = 'runbanner active';
+  } else {
+    activeRunId = null;
+    banner.textContent = 'No active load test';
+    banner.className = 'runbanner';
+  }
+}
+
+async function refreshUptime() {
+  for (const [elId, idx] of [['uptimeLocal', 0], ['uptimeFailover', 1]]) {
+    if (regions.length <= idx) continue;
+    try {
+      const r = await j('/kpi/uptime?region=' + encodeURIComponent(regions[idx]));
+      document.getElementById(elId).innerHTML = '<span>' + regions[idx] + '</span><span>' + fmtPct(r.uptimePercent) + ' (' + r.outages.length + ' outages)</span>';
+    } catch (e) { /* ignore */ }
+  }
+}
+
+async function refreshNetworkTime() {
+  if (regions.length === 0) return;
+  const series = await j('/report/series?operation=network.ping&region=' + encodeURIComponent(regions[0]));
+  const labels = series.map(p => new Date(p.windowStart).toLocaleTimeString());
+  const p50 = series.map(p => p.p50Micros);
+  const p95 = series.map(p => p.p95Micros);
+  if (!netChart) {
+    netChart = new Chart(document.getElementById('networkTimeChart'), {
+      type: 'line',
+      data: { labels, datasets: [
+        { label: 'p50', data: p50, borderColor: '#4ade80', tension: .3, pointRadius: 0 },
+        { label: 'p95', data: p95, borderColor: '#fbbf24', tension: .3, pointRadius: 0 }
+      ]},
+      options: { animation: false, scales: { x: { display: false } }, plugins: { legend: { labels: { color: '#9aa4b2' } } } }
+    });
+  } else {
+    netChart.data.labels = labels;
+    netChart.data.datasets[0].data = p50;
+    netChart.data.datasets[1].data = p95;
+    netChart.update();
+  }
+}
+
+async function refreshGeo() {
+  if (regions.length < 2) return;
+  const dirs = [regions[0] + '->' + regions[1], regions[1] + '->' + regions[0]];
+  const table = document.getElementById('geoTable');
+  table.innerHTML = '';
+  for (const dir of dirs) {
+    try {
+      const r = await j('/kpi/geo-replication-time?direction=' + encodeURIComponent(dir));
+      const row = document.createElement('tr');
+      row.innerHTML = '<td>' + dir + '</td><td class="muted">p50=' + r.latencyMillis.p50 + 'ms p99=' + r.latencyMillis.p99
+        + 'ms max=' + r.latencyMillis.max + 'ms timeouts=' + r.timeoutCount + '</td>';
+      table.appendChild(row);
+    } catch (e) { /* ignore */ }
+  }
+}
+
+async function refreshThroughput() {
+  const el = document.getElementById('throughputStat');
+  if (!activeRunId) { el.textContent = 'no active run'; return; }
+  try {
+    const r = await j('/kpi/throughput/' + activeRunId);
+    el.textContent = r.achievedOpsPerSec.toFixed(1) + ' ops/sec, p99=' + r.overall.p99Micros + 'µs';
+    const series = await j('/report/series?operation=loadgen.get&runId=' + activeRunId);
+    const labels = series.map(p => new Date(p.windowStart).toLocaleTimeString());
+    const p99 = series.map(p => p.p99Micros);
+    if (!throughputChart) {
+      throughputChart = new Chart(document.getElementById('throughputChart'), {
+        type: 'line',
+        data: { labels, datasets: [{ label: 'GET p99 (µs)', data: p99, borderColor: '#60a5fa', tension: .3, pointRadius: 0 }] },
+        options: { animation: false, scales: { x: { display: false } }, plugins: { legend: { labels: { color: '#9aa4b2' } } } }
+      });
+    } else {
+      throughputChart.data.labels = labels;
+      throughputChart.data.datasets[0].data = p99;
+      throughputChart.update();
+    }
+  } catch (e) { el.textContent = 'no data yet'; }
+}
+
+async function refreshCacheAside() {
+  try {
+    const r = await j('/kpi/cache-aside/report');
+    document.getElementById('cacheAsideStat').textContent = r.missRatio.toFixed(1) + '% miss ratio';
+    document.getElementById('cacheAsideDetail').innerHTML = '<span>hit=' + r.hitCount + ' miss=' + r.missCount + '</span><span>degraded=' + r.degradedCount + '</span>';
+  } catch (e) { /* ignore */ }
+}
+
+async function refreshToken() {
+  try {
+    const r = await j('/kpi/token-lifecycle');
+    document.getElementById('tokenStat').textContent = r.successCount + ' renewed / ' + r.failureCount + ' failed';
+  } catch (e) { /* ignore */ }
+}
+
+async function refreshConsistency() {
+  try {
+    const r = await j('/kpi/consistency/report');
+    const table = document.getElementById('consistencyTable');
+    table.innerHTML = '<tr><td>staleness</td><td class="muted">' + r.stalenessProbeCount + ' probes, '
+      + r.staleAtT0Count + ' stale-at-t0, p99=' + r.staleWindowMillis.p99 + 'ms</td></tr>'
+      + '<tr><td>conflict</td><td class="muted">' + r.conflictProbeCount + ' probes, '
+      + r.convergedCount + ' converged, ' + r.divergedCount + ' diverged</td></tr>';
+  } catch (e) { /* ignore */ }
+}
+
+async function runPreset(name) {
+  try {
+    const r = await j('/presets/' + name + '/run', { method: 'POST' });
+    alert('Started preset "' + name + '": runId=' + r.runId + '\n' + r.note);
+  } catch (e) {
+    alert('Preset failed: ' + e);
+  }
+}
+
+async function stopLoadgen() {
+  try {
+    await fetch('/loadgen/stop', { method: 'POST' });
+  } catch (e) { /* ignore */ }
+}
+
+async function refreshAll() {
+  try {
+    await refreshBreaker();
+    await Promise.all([refreshRun(), refreshUptime(), refreshNetworkTime(), refreshGeo(),
+      refreshCacheAside(), refreshToken(), refreshConsistency()]);
+    await refreshThroughput();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+refreshAll();
+setInterval(refreshAll, 5000);
+</script>
+</body>
+</html>
