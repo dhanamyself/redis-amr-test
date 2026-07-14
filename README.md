@@ -636,8 +636,9 @@ requirements:
    `DefaultAzureCredential` has nothing to resolve (see
    [managed identity auth](#how-entra-id-managed-identity-auth-works) above).
 4. **Resource requests/limits**: the load generator is CPU-hungry by design — set real limits or
-   an unbounded pod will get evicted mid-test and ruin a run. Size for your concurrency/rate
-   targets; start with ~1 CPU / 1Gi request as a floor and tune from there.
+   an unbounded pod will get evicted mid-test and ruin a run. See
+   [Sizing resource requests/limits and JVM flags](#sizing-resource-requestslimits-and-jvm-flags)
+   below for concrete numbers and the reasoning behind them.
 5. **Probes**: wire `GET /actuator/health/readiness` and `GET /actuator/health/liveness`
    (Spring Boot Actuator probe groups are enabled in `application.yml`).
 6. **Graceful shutdown**: `server.shutdown=graceful` is already set with a 45s phase timeout.
@@ -651,6 +652,66 @@ requirements:
 8. **Ingress/Service**: expose port 8080; the dashboard and all REST endpoints are unauthenticated
    by design (internal test tool) — put it behind whatever network boundary your cluster expects
    for internal tooling.
+
+### Sizing resource requests/limits and JVM flags
+
+The Dockerfile's `ENTRYPOINT` already sets `-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0`
+with no fixed `-Xmx`, so heap size is derived from the container's cgroup memory **limit** at JVM
+startup, not from a hardcoded value. That has one hard consequence for the pod spec: **you must
+set an explicit `resources.limits.memory`, not just a request.** If you only set a request and
+skip the limit, the container has no cgroup memory ceiling, so the JVM sizes its heap off the
+*node's* total memory instead of the pod's — a latent OOM-kill risk the moment the node is
+bin-packed with other pods. Leave the existing JVM flags as they are; nothing about this app needs
+a fixed `-Xmx` instead, since container-aware sizing is exactly what you want across differently
+sized node pools.
+
+Recommended starting point:
+
+| | CPU | Memory |
+|---|---|---|
+| **Request** | `1` | `1Gi` |
+| **Limit** | `2` | `2Gi` |
+
+```yaml
+resources:
+  requests:
+    cpu: "1"
+    memory: "1Gi"
+  limits:
+    cpu: "2"
+    memory: "2Gi"
+```
+
+Why these numbers, based on what actually drives CPU/memory in this codebase:
+
+- **CPU is the real bottleneck, by design.** The load generator's virtual-thread executor can
+  drive concurrency up to 128 (the `session-peak` preset, `PresetService`) against a 64-connection
+  pool (`AMR_POOL_MAX_TOTAL`), and every operation sits on the hot path of the very latency numbers
+  this harness exists to produce. Under-provisioning CPU doesn't just slow the app down, it
+  contaminates the measurement — so give it room to burst (`limits.cpu: 2`) rather than throttling
+  it at the request value.
+- **Memory pressure is dominated by framework/classloading baseline, not the workload itself.**
+  Session payloads top out at 20KB (`AMRKPI_VALUE_SIZE_MAX`), and the HdrHistogram recorders
+  (keyed per `runId`/`region`/`operation`, 3 significant digits, 60s trackable range — see
+  `OperationRecorder`) add only a few MB total even across a 2-hour `soak` preset. The real weight
+  is Spring MVC + JPA/Hibernate + Thymeleaf + Actuator + the Azure Identity SDK + Apache POI +
+  PDFBox + Jedis + Resilience4j all resident at once.
+- **Report export is the one place memory can spike.** `poi-ooxml`'s `XSSFWorkbook` builds the
+  whole workbook in memory (not the streaming `SXSSF` variant), so a PDF/XLSX export (`GET
+  /reports/export`) covering a long soak run's full rollup history can transiently push well above
+  steady-state. The 2Gi limit (→ a ~1.5Gi heap ceiling at 75%) exists mainly to give that spike
+  headroom, not for steady-state load-test traffic.
+- **At a 1Gi limit, heap is only ~768Mi**, leaving ~256Mi for metaspace, thread stacks, direct
+  buffers, and JVM native overhead — survivable at idle but thin the moment a report export lands
+  on top of an active run. That's why the limit is set above the request rather than equal to it.
+
+If a run being evicted mid-test is worse for you than the cost of a slightly oversized pod, set
+`limits` equal to `requests` (`1` CPU / `1Gi`) instead — that buys Kubernetes' Guaranteed QoS
+class (lowest priority for eviction under node memory pressure) at the cost of losing the
+CPU/memory burst headroom above. Whichever you pick, validate it: run the `session-peak` preset
+and a PDF/XLSX export concurrently and watch `kubectl top pod`, then adjust. These numbers are
+sized from reading the code's actual resource-usage patterns, not from a profiled run against a
+real AMR instance.
 
 ### Environment variable reference
 
